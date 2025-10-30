@@ -1,4 +1,5 @@
-requests
-pandas
-pytz
+Flask
+gunicorn
 psycopg2-binary
+flask-cors
+numpy
