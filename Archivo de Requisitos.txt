@@ -1,4 +1,0 @@
-requests
-pandas
-pytz
-psycopg2-binary
