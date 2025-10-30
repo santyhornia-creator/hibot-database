@@ -3,11 +3,13 @@ import json
 from datetime import datetime, timedelta, time
 import os
 import pandas as pd
+import psycopg2
+from psycopg2 import extras
 import sys
 import subprocess
-import psycopg2 # Nueva librería para PostgreSQL
+import numpy as np # <-- Importante: Añadir numpy
 
-# Instalar 'pytz' si no está disponible (Render lo hará usando requirements.txt)
+# Instalar 'pytz' si no está disponible
 try:
     import pytz
 except ImportError:
@@ -18,14 +20,16 @@ except ImportError:
 # --- CONFIGURACIÓN HIBOT ---
 HIBOT_APP_ID = "6749f162ea4755c8d8df65f8"
 HIBOT_APP_SECRET = "260903b7-bdbb-44d7-acaf-bad9decea3a8"
-BASE_URL = "https://pdn.api.hibot.us/api_external"
+# --- ¡CORRECCIÓN DE LA URL AQUÍ! ---
+# Antes decía: "https.api.hibot.us/api_external"
+# Lo correcto es: "https://api.hibot.us/api_external"
+BASE_URL = "https://api.hibot.us/api_external"
 
 # --- CONFIGURACIÓN DE LA BASE DE DATOS ---
-# Render nos dará esta URL y la pondremos como variable de entorno
-DATABASE_URL = os.environ.get('DATABASE_URL')
 ARGENTINA_TZ = pytz.timezone('America/Argentina/Buenos_Aires')
+DATABASE_URL = os.environ.get('DATABASE_URL') # Se obtiene de Render
 
-# --- FUNCIONES DE HIBOT (Sin cambios) ---
+# --- FUNCIONES DE HIBOT ---
 def get_hibot_token():
     login_url = f"{BASE_URL}/login"
     payload = {"appId": HIBOT_APP_ID, "appSecret": HIBOT_APP_SECRET}
@@ -43,9 +47,11 @@ def get_current_month_date_range():
     today = datetime.now(ARGENTINA_TZ)
     end_date = today
     start_date = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if start_date.weekday() == 6: # Si es Domingo
+    if start_date.weekday() == 6: 
         start_date += timedelta(days=1)
-    print(f"🗓️  Rango de fechas a procesar: {start_date.strftime('%Y-%m-%d')} a {end_date.strftime('%Y-%m-%d')}")
+    
+    # Para la primera ejecución, descargamos todo el mes
+    # Para las siguientes, solo el día actual
     return start_date, end_date
 
 def get_hibot_conversations(token, start_date, end_date):
@@ -67,211 +73,182 @@ def get_hibot_conversations(token, start_date, end_date):
             pass
         return []
 
-# --- ¡NUEVAS FUNCIONES DE BASE DE DATOS! ---
+# --- FUNCIONES DE BASE DE DATOS ---
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        print("🔌 Conexión a la base de datos PostgreSQL exitosa.")
+        return conn
+    except Exception as e:
+        print(f"❌ No se pudo conectar a la base de datos: {e}")
+        return None
 
-def create_table(conn):
-    """Crea la tabla 'conversations' si no existe."""
+def create_conversations_table(conn):
     create_table_query = """
     CREATE TABLE IF NOT EXISTS conversations (
-        id_conversacion VARCHAR(255) PRIMARY KEY,
-        tipificacion TEXT,
-        fecha_creacion TIMESTAMP,
-        fecha_cierre TIMESTAMP,
-        fecha_delegado TIMESTAMP,
-        fecha_asignado TIMESTAMP,
-        hora_atencion TIMESTAMP,
-        duracion_ms VARCHAR(50),
-        nota TEXT,
-        estado TEXT,
-        tiempo_espera_ms VARCHAR(50),
-        tiempo_respuesta_ms VARCHAR(50),
-        nombre_agente TEXT,
-        tipo_canal TEXT,
-        campaña TEXT,
-        dinamico TEXT,
-        numero_ov TEXT,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        hibot_id VARCHAR(255) PRIMARY KEY,
+        created TIMESTAMPTZ,
+        closed TIMESTAMPTZ,
+        delegated TIMESTAMPTZ,
+        assigned TIMESTAMPTZ,
+        attentionHour TIMESTAMPTZ,
+        duration BIGINT,
+        waitTime BIGINT,
+        answerTime BIGINT,
+        typing VARCHAR(255),
+        note TEXT,
+        status VARCHAR(255),
+        agent_name VARCHAR(255),
+        channel_type VARCHAR(255),
+        campaign_name VARCHAR(255),
+        dinamico VARCHAR(255),
+        numeroov VARCHAR(255),
+        last_updated TIMESTAMPTZ DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
     );
     """
     try:
         with conn.cursor() as cur:
             cur.execute(create_table_query)
             conn.commit()
-        print("✅ Tabla 'conversations' verificada/creada exitosamente.")
+            print("✔️ Tabla 'conversations' asegurada (creada o ya existente).")
     except Exception as e:
         print(f"❌ Error al crear la tabla: {e}")
-        raise e
+        conn.rollback()
 
-def clear_and_insert_data(conn, data_df):
-    """Borra los datos del mes actual e inserta los nuevos."""
+def upsert_conversations(conn, df):
+    column_order = [
+        'hibot_id', 'created', 'closed', 'delegated', 'assigned', 'attentionHour',
+        'duration', 'waitTime', 'answerTime', 'typing', 'note', 'status',
+        'agent_name', 'channel_type', 'campaign_name', 'dinamico', 'numeroov'
+    ]
     
-    # Asegurarnos de que las columnas coinciden
-    # Convertimos los nombres del DataFrame a los nombres de la BDD
-    column_mapping = {
-        'ID_Conversacion': 'id_conversacion',
-        'Tipificacion': 'tipificacion',
-        'Fecha_Creacion': 'fecha_creacion',
-        'Fecha_Cierre': 'fecha_cierre',
-        'Fecha_Delegado': 'fecha_delegado',
-        'Fecha_Asignado': 'fecha_asignado',
-        'Hora_Atencion': 'hora_atencion',
-        'Duracion_ms': 'duracion_ms',
-        'Nota': 'nota',
-        'Estado': 'estado',
-        'Tiempo_Espera_ms': 'tiempo_espera_ms',
-        'Tiempo_Respuesta_ms': 'tiempo_respuesta_ms',
-        'Nombre_Agente': 'nombre_agente',
-        'Tipo_Canal': 'tipo_canal',
-        'Campaña': 'campaña',
-        'Dinamico': 'dinamico',
-        'Numero_OV': 'numero_ov'
-    }
-    df_renamed = data_df.rename(columns=column_mapping)
+    # --- 4. FORMATEO Y LIMPIEZA DE DATOS ---
+    print("🧹 Procesando y limpiando datos...")
     
-    # Obtener el primer y último día del mes para el query DELETE
-    start_date = df_renamed['fecha_creacion'].min().replace(day=1, hour=0, minute=0, second=0)
-    # Convertimos a string en formato que PostgreSQL entiende
-    start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+    df_normalized = pd.json_normalize(df, sep='.')
+    
+    df_renamed = df_normalized.rename(columns={
+        'id': 'hibot_id',
+        'agent.name': 'agent_name',
+        'channel.type': 'channel_type',
+        'campaign.name': 'campaign_name',
+        'status.name': 'status_obj', # Renombramos para evitar colisión
+    })
+    
+    # --- Manejo de Fechas y Nulos ---
+    date_columns = ['created', 'closed', 'delegated', 'assigned', 'attentionHour']
+    for col in date_columns:
+        if col in df_renamed.columns:
+            # --- ¡LA CORRECCIÓN ESTÁ AQUÍ! ---
+            # 1. Forzamos todo a número primero. Los valores malos (ej: "") se vuelven NaN.
+            df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
+            
+            # 2. Ahora, to_datetime solo recibe números válidos o NaN, evitando el overflow.
+            df_renamed[col] = pd.to_datetime(df_renamed[col], unit='ms', errors='coerce')
+            df_renamed[col] = df_renamed[col].dt.tz_localize('UTC').dt.tz_convert(ARGENTINA_TZ)
+        else:
+            df_renamed[col] = pd.NaT
+            
+    # --- Manejo de Columnas Faltantes ---
+    # Asegurarnos de que todas las columnas de la BBDD existan en el DataFrame
+    for col in column_order:
+        if col not in df_renamed.columns:
+            # Si es una columna de fecha, la llenamos con NaT, sino con None
+            if col in date_columns:
+                 df_renamed[col] = pd.NaT
+            else:
+                df_renamed[col] = None
+    
+    # Lógica inteligente para 'status' (como en el script de Google Sheets)
+    if 'status_obj' in df_renamed.columns:
+        df_renamed['status'] = df_renamed['status_obj']
+    elif 'status' in df_renamed.columns:
+        df_renamed['status'] = df_renamed['status']
+    else:
+        df_renamed['status'] = None
 
+    df_final = df_renamed[column_order]
+    
+    # --- ¡LA CORRECCIÓN ESTÁ AQUÍ! ---
+    # Reemplazamos NaT (Not a Time) y NaN (Not a Number) por None (que se traduce a NULL en SQL)
+    # Usamos .replace() para ser más explícitos que .where()
+    df_final = df_final.replace({pd.NaT: None, np.nan: None})
+    
+    print(f"✔️ Datos procesados. {len(df_final)} filas listas para insertar.")
+    
+    data_tuples = [tuple(x) for x in df_final.to_numpy()]
+
+    # --- 5. INSERCIÓN EN BASE DE DATOS (UPSERT) ---
+    print(f"🔄 Sincronizando {len(data_tuples)} filas con la base de datos...")
+    
+    insert_query = f"""
+    INSERT INTO conversations ({', '.join(column_order)})
+    VALUES %s
+    ON CONFLICT (hibot_id) DO UPDATE SET
+        created = EXCLUDED.created,
+        closed = EXCLUDED.closed,
+        delegated = EXCLUDED.delegated,
+        assigned = EXCLUDED.assigned,
+        attentionHour = EXCLUDED.attentionHour,
+        duration = EXCLUDED.duration,
+        waitTime = EXCLUDED.waitTime,
+        answerTime = EXCLUDED.answerTime,
+        typing = EXCLUDED.typing,
+        note = EXCLUDED.note,
+        status = EXCLUDED.status,
+        agent_name = EXCLUDED.agent_name,
+        channel_type = EXCLUDED.channel_type,
+        campaign_name = EXCLUDED.campaign_name,
+        dinamico = EXCLUDED.dinamico,
+        numeroov = EXCLUDED.numeroov,
+        last_updated = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC');
+    """
+    
     try:
         with conn.cursor() as cur:
-            # 1. Borrar solo los datos del mes en curso
-            # (Usamos 'fecha_creacion' que ya está convertida a Timestamp)
-            print(f"🧹 Limpiando datos del mes en curso (desde {start_date_str})...")
-            cur.execute("DELETE FROM conversations WHERE fecha_creacion >= %s", (start_date_str,))
-            
-            # 2. Preparar e Insertar los nuevos datos
-            print(f"✍️  Insertando {len(df_renamed)} filas en la base de datos...")
-            
-            # Convertir DataFrame a una lista de tuplas
-            # Reemplazamos NaT/NaN por None (que se convertirá en NULL en la BDD)
-            df_cleaned = df_renamed.where(pd.notnull(df_renamed), None)
-            tuples = [tuple(x) for x in df_cleaned.to_numpy()]
-            
-            # Nombres de columnas como string: "col1, col2, col3"
-            cols = ','.join(list(df_cleaned.columns))
-            # String de valores: "%s, %s, %s"
-            vals = ','.join(['%s'] * len(df_cleaned.columns))
-            
-            # Query final
-            insert_query = f"INSERT INTO conversations ({cols}) VALUES ({vals})"
-            
-            # Ejecutar la inserción masiva
-            cur.executemany(insert_query, tuples)
-            
+            extras.execute_values(cur, insert_query, data_tuples)
             conn.commit()
-            
-        print("🚀 ¡Proceso completado! Base de datos actualizada.")
-        
+            print(f"🚀 Sincronización de {len(data_tuples)} filas completada.")
     except Exception as e:
-        print(f"❌ Error durante la limpieza/inserción: {e}")
-        conn.rollback() # Revertir cambios en caso de error
-        raise e
+        print(f"❌ Error durante el 'UPSERT' a la base de datos: {e}")
+        conn.rollback()
 
-# --- LÓGICA DE HORARIOS ---
-def is_within_business_hours():
-    now = datetime.now(ARGENTINA_TZ)
-    current_time = now.time()
-    current_day = now.weekday()
-    if 0 <= current_day <= 4:
-        if current_time >= time(9, 0) and current_time <= time(18, 0):
-            return True
-    if current_day == 5:
-        if current_time >= time(9, 0) and current_time <= time(13, 0):
-            return True
-    return False
-
-# --- FUNCIÓN DE SINCRONIZACIÓN PRINCIPAL (MODIFICADA) ---
-def run_sync_process():
-    print(f"[{datetime.now(ARGENTINA_TZ).strftime('%Y-%m-%d %H:%M:%S')}] Iniciando sincronización...")
-    hibot_token = get_hibot_token()
-    if hibot_token:
-        start_month, end_today = get_current_month_date_range()
-        
-        all_conversations = []
-        current_day = start_month
-        while current_day.date() <= end_today.date():
-            start_of_day = current_day.replace(hour=0, minute=0, second=0)
-            end_of_day = current_day.replace(hour=23, minute=59, second=59)
-            daily_conversations = get_hibot_conversations(hibot_token, start_of_day, end_of_day)
-            if daily_conversations:
-                all_conversations.extend(daily_conversations)
-            current_day += timedelta(days=1)
-        
-        print(f"\n✨ Descarga diaria finalizada. Total de conversaciones acumuladas: {len(all_conversations)}")
-        
-        if all_conversations:
-            df_normalized = pd.json_normalize(all_conversations, sep='.')
-            df_normalized.columns = [col.replace('fields.', '').replace('.value', '') for col in df_normalized.columns]
-
-            final_columns_map = {
-                'id': 'ID_Conversacion', 'typing': 'Tipificacion', 'created': 'Fecha_Creacion',
-                'closed': 'Fecha_Cierre', 'delegated': 'Fecha_Delegado', 'assigned': 'Fecha_Asignado',
-                'attentionHour': 'Hora_Atencion', 'duration': 'Duracion_ms', 'note': 'Nota',
-                'status': 'Estado', 'waitTime': 'Tiempo_Espera_ms', 'answerTime': 'Tiempo_Respuesta_ms',
-                'agent.name': 'Nombre_Agente', 'channel.type': 'Tipo_Canal', 'campaign.name': 'Campaña',
-                'Dinamico': 'Dinamico', 'numeroov': 'Numero_OV'
-            }
-            final_df = pd.DataFrame()
-            for original_col, new_name in final_columns_map.items():
-                if new_name == 'Estado':
-                    if 'status.name' in df_normalized:
-                        final_df[new_name] = df_normalized['status.name']
-                    elif 'status' in df_normalized:
-                        final_df[new_name] = df_normalized['status']
-                    else:
-                        final_df[new_name] = ""
-                elif original_col in df_normalized:
-                    final_df[new_name] = df_normalized[original_col]
-                else:
-                    final_df[new_name] = ""
-            
-            date_columns = ['Fecha_Creacion', 'Fecha_Cierre', 'Fecha_Delegado', 'Fecha_Asignado', 'Hora_Atencion']
-            for col in date_columns:
-                if col in final_df.columns:
-                    # Convertir de milisegundos a datetime
-                    final_df[col] = pd.to_datetime(final_df[col], unit='ms', errors='coerce')
-                    # Localizar en UTC y convertir a zona horaria de Argentina
-                    final_df.loc[final_df[col].notna(), col] = final_df.loc[final_df[col].notna(), col].dt.tz_localize('UTC').dt.tz_convert(ARGENTINA_TZ)
-
-            # --- ¡NUEVA LÓGICA DE CARGA A LA BDD! ---
-            conn = None
-            try:
-                if not DATABASE_URL:
-                    print("❌ Error: La variable de entorno DATABASE_URL no está configurada.")
-                    return
-
-                # Conectar a la base de datos PostgreSQL
-                conn = psycopg2.connect(DATABASE_URL)
-                print("✅ Conexión a la base de datos PostgreSQL exitosa.")
-                
-                # 1. Asegurar que la tabla exista
-                create_table(conn)
-                
-                # 2. Limpiar datos del mes actual e insertar los nuevos
-                clear_and_insert_data(conn, final_df)
-                
-            except Exception as e:
-                print(f"❌ Error en la operación de base de datos: {e}")
-            finally:
-                if conn:
-                    conn.close() # Siempre cerrar la conexión
-                    print("🔌 Conexión a la base de datos cerrada.")
-
-        else:
-            print("No se encontraron conversaciones para actualizar en todo el período.")
-    print(f"--- Sincronización completada a las {datetime.now(ARGENTINA_TZ).strftime('%H:%M:%S')} ---")
-
-# --- EJECUCIÓN PRINCIPAL ---
-if __name__ == "__main__":
-    # Render (como Cron Job) no se preocupa por el horario. Simplemente
-    # le diremos que ejecute el script cada 15 min DENTRO del horario laboral.
-    # El script mismo no necesita verificar la hora, solo ejecutarse.
+# --- EJECUCUIÓN PRINCIPAL ---
+def main():
+    print(f"[{datetime.now(ARGENTINA_TZ).strftime('%Y-%m-%d %H:%M:%S')}] Iniciando Sincronizador de HiBot...")
     
-    print("Iniciando el Sincronizador de HiBot (Modo Cron Job)...")
-    try:
-        run_sync_process()
-    except Exception as e:
-        print(f"Error inesperado al ejecutar el script: {e}")
-        # Salir con un código de error para que Render sepa que falló
-        sys.exit(1)
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    create_conversations_table(conn)
+    
+    hibot_token = get_hibot_token()
+    if not hibot_token:
+        conn.close()
+        return
+        
+    start_date, end_date = get_current_month_date_range()
+    
+    all_conversations = []
+    current_day = start_date
+    while current_day.date() <= end_date.date():
+        day_start = current_day.replace(hour=0, minute=0, second=0)
+        day_end = current_day.replace(hour=23, minute=59, second=59)
+        daily_conversations = get_hibot_conversations(hibot_token, day_start, day_end)
+        if daily_conversations:
+            all_conversations.extend(daily_conversations)
+        current_day += timedelta(days=1)
+        
+    if all_conversations:
+        print(f"\n✨ Descarga diaria finalizada. Total de conversaciones acumuladas: {len(all_conversations)}")
+        upsert_conversations(conn, all_conversations)
+    else:
+        print("No se encontraron conversaciones en el período.")
+
+    conn.close()
+    print("🔌 Conexión a la base de datos cerrada.")
+
+if __name__ == "__main__":
+    main()
+
